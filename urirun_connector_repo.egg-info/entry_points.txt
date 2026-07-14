@@ -1,0 +1,3 @@
+[urirun.bindings]
+repo = urirun_connector_repo.core:urirun_bindings
+sync = urirun_connector_repo.core:sync_bindings

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "urirun-connector-repo"
+version = "0.1.0"
+description = "repo:// + sync:// controlled persistence: worktree/branch/commit/PR + merge-gate (auto_pr|human_review|block), lease-gated, provenance"
+requires-python = ">=3.10"
+dependencies = ["urirun"]
+[project.entry-points."urirun.bindings"]
+repo = "urirun_connector_repo.core:urirun_bindings"
+sync = "urirun_connector_repo.core:sync_bindings"
+[tool.setuptools]
+packages = ["urirun_connector_repo"]

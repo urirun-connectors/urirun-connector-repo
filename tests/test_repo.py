@@ -37,14 +37,25 @@ def test_secret_scan_detects_and_passes_clean():
 
 # ── merge-gate decisions (the 10 scenarios) ───────────────────────────────────
 
-def test_3_connector_only_change_auto_pr():
+def test_3_connector_only_change_auto_push():
     d = core.merge_gate(files=["urirun-connector-kvm/README.md"])
-    assert d["decision"] == "auto_pr" and d["allowed_next_uri"].startswith("repo://")
+    assert d["decision"] == "auto_push" and d["allowed_next_uri"] == "repo://host/push/command/main"
 
 
-def test_4_core_runtime_change_human_review():
+def test_4_core_runtime_change_also_pushes_since_there_is_no_review_queue():
+    # PRs are gone, so a `review`-class path has nowhere to wait: it lands on main like any
+    # other change once lease, secrets and tests pass. Only `never`-class paths stay blocked.
     d = core.merge_gate(files=["urirun/adapters/python/urirun/host/dispatch.py"])
-    assert d["decision"] == "human_review" and d["allowed_next_uri"].startswith("approval://")
+    assert d["decision"] == "auto_push" and d["allowed_next_uri"] == "repo://host/push/command/main"
+
+
+def test_no_decision_path_still_offers_a_pull_request():
+    for files in (["urirun-connector-kvm/README.md"], ["urirun/adapters/python/urirun/host/dispatch.py"]):
+        for is_git in (True, False):
+            d = core.merge_gate(files=files, is_git=is_git)
+            assert d["decision"] not in ("auto_pr", "human_review")
+            assert "pr/command/create" not in d.get("allowed_next_uri", "")
+            assert "approval://" not in d.get("allowed_next_uri", "")
 
 
 def test_5_secret_scan_fail_blocks():
@@ -64,7 +75,7 @@ def test_1_gate_blocks_without_valid_lease():
 
 def test_7_non_git_project_routes_to_sync_publish():
     d = core.merge_gate(files=["urirun-connector-kvm/README.md"], is_git=False)
-    assert d["decision"] == "auto_pr" and d["allowed_next_uri"].startswith("sync://")
+    assert d["decision"] == "auto_push" and d["allowed_next_uri"].startswith("sync://")
 
 
 def test_never_auto_change_blocks_even_if_tests_pass():
@@ -87,11 +98,30 @@ def test_2_commit_rejected_foreign_lease(monkeypatch):
     assert r["rejected"] is True
 
 
-def test_8_commit_refuses_main_branch(monkeypatch):
+def test_8_commit_on_main_is_allowed_trunk_based(monkeypatch):
+    # Inverted with the move to trunk-based: main is a legal commit target, and the lease is
+    # the only hard gate left in commit_create.
     monkeypatch.setattr(core, "_lease_valid", lambda lid, w: True)
     monkeypatch.setattr(core, "_git", lambda repo, *a, **k: (0, "main", ""))  # HEAD is main
     r = core.commit_create("/x", "msg", worker="w1", lease_id="lease:w1:T1")
-    assert r["ok"] is False and "main" in r["reason"]
+    assert r["ok"] is True and r["branch"] == "main"
+
+
+def test_push_main_is_fast_forward_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr(core, "_git", lambda repo, *a, **k: (calls.append(a), (0, "sha", ""))[1])
+    r = core.push_main("/x")
+    assert r["ok"] is True and r["branch"] == "main"
+    pushed = [a for a in calls if a and a[0] == "push"][0]
+    assert "HEAD:main" in pushed
+    # No force: a rejected push must stay rejected rather than overwrite someone else's commit.
+    assert not any(str(arg).startswith("--force") for arg in pushed)
+
+
+def test_push_main_requires_a_lease_at_the_handler(monkeypatch):
+    monkeypatch.setattr(core, "_lease_valid", lambda lid, w: False)
+    r = core.push_command_main(repo="/x", worker="w2", lease_id="lease:w1:T1")
+    assert r["ok"] is False and r.get("rejected") is True
 
 
 def test_lease_valid_checks_work_connector(monkeypatch):

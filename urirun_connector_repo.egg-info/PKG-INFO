@@ -1,6 +1,0 @@
-Metadata-Version: 2.4
-Name: urirun-connector-repo
-Version: 0.1.0
-Summary: repo:// + sync:// controlled persistence: worktree/branch/commit/PR + merge-gate (auto_pr|human_review|block), lease-gated, provenance
-Requires-Python: >=3.10
-Requires-Dist: urirun

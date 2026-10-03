@@ -1,20 +1,23 @@
 # Author: Tom Sapletta · Part of the ifURI solution.
 """urirun-connector-repo — `repo://` + `sync://` controlled persistence pipeline (IFURI-177).
 
-Ends the "Nothing committed (Tom commits)" bottleneck WITHOUT letting an agent commit straight
-to main. A worker takes a `work://` lease, works in isolation (worktree), tests, then a
-**merge-gate** classifies the change and decides how it may be persisted:
+Trunk-based: this project does not use pull requests. A worker takes a `work://` lease, works
+in isolation (worktree), tests, then a **merge-gate** decides whether the change may land on
+main directly:
 
-  * ``auto_pr``      — safe change (connector / README / tests / docs) → branch + PR (or, for a
-                       non-git sync project, a patch artifact + publish), no human needed.
-  * ``human_review`` — core runtime / policy / grant / proxy / security / deploy → PR held for a
-                       human approval.
-  * ``block``        — no valid lease, a detected secret, failing tests, or a never-auto path.
+  * ``auto_push``    — gates passed and the path is not never-auto → commit + push to main (or,
+                       for a non-git sync project, a patch artifact + publish).
+  * ``block``        — no valid lease, a detected secret, failing tests, or a never-auto path
+                       (core runtime / policy / grant / proxy / security / deploy).
+
+Dropping PRs removed the *human review* step, not the automated ones: lease ownership, secret
+scan, tests and the never-auto path list still gate every push, and a change that fails them
+stays blocked rather than falling back to a review queue that no longer exists.
 
 Nothing is committed without an active lease OWNED by the committing worker, and every commit
 message carries provenance (worker, lease, locks, tests/smoke/secret-scan) so a change is
-auditable by URI later. git repos → branch/PR/merge; non-git `sync` projects (e.g. if-uri via
-connect.ifuri.com) → patch artifact + sync publish, never `git merge`.
+auditable by URI later. git repos → commit + push to main; non-git `sync` projects (e.g. if-uri
+via connect.ifuri.com) → patch artifact + sync publish, never `git merge`.
 """
 from __future__ import annotations
 
@@ -110,7 +113,11 @@ def _lease_valid(lease_id: str, worker: str) -> bool:
 def merge_gate(*, files: list[str], labels: list[str] | None = None, tests_passed: bool = True,
                secrets_clean: bool = True, lease_valid: bool = True, is_git: bool = True) -> dict:
     """The decision engine. Returns ``{decision, reason, allowed_next_uri?}`` where decision is
-    one of ``auto_pr`` / ``human_review`` / ``block``."""
+    one of ``auto_push`` / ``block``.
+
+    There is no ``human_review`` outcome any more: with PRs gone there is nowhere to hold a
+    change for a human, so a `review`-class path lands on main like any other once the
+    automated gates pass. Only `never`-class paths stay blocked."""
     if not lease_valid:
         return {"decision": "block", "reason": "no active lease owned by this worker"}
     if not secrets_clean:
@@ -120,11 +127,8 @@ def merge_gate(*, files: list[str], labels: list[str] | None = None, tests_passe
     cls = classify_change(files, labels)
     if cls["class"] == "never":
         return {"decision": "block", "reason": cls["reason"]}
-    if cls["class"] == "auto":
-        nxt = "repo://host/pr/command/create" if is_git else "sync://host/project/command/publish"
-        return {"decision": "auto_pr", "reason": cls["reason"], "allowed_next_uri": nxt}
-    return {"decision": "human_review", "reason": cls["reason"],
-            "allowed_next_uri": "approval://human/pr/command/review"}
+    nxt = "repo://host/push/command/main" if is_git else "sync://host/project/command/publish"
+    return {"decision": "auto_push", "reason": cls["reason"], "allowed_next_uri": nxt}
 
 
 def provenance_message(ticket: str, title: str, worker: str, lease_id: str, locks: list[str],
@@ -174,13 +178,11 @@ def worktree_remove(repo: str, worktree: str) -> dict:
 
 def commit_create(repo: str, message: str, *, worker: str = "", lease_id: str = "",
                   add_all: bool = True) -> dict:
-    """Commit on the current branch — ONLY under a valid lease owned by ``worker``. Never main
-    is enforced by the pipeline (worktree/branch); here we hard-gate on the lease."""
+    """Commit on the current branch — ONLY under a valid lease owned by ``worker``. Trunk-based:
+    main is a legal target, so the lease is the only hard gate left here."""
     if not _lease_valid(lease_id, worker):
         return {"ok": False, "rejected": True, "reason": "commit requires an active lease owned by this worker"}
     _, branch, _ = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-    if branch in ("main", "master"):
-        return {"ok": False, "rejected": True, "reason": f"refuse to commit directly to {branch} — use a branch/worktree"}
     if add_all:
         _git(repo, "add", "-A")
     rc, out, err = _git(repo, "commit", "-m", message)
@@ -190,23 +192,24 @@ def commit_create(repo: str, message: str, *, worker: str = "", lease_id: str = 
     return {"ok": True, "sha": sha, "branch": branch, "provenance_uri": f"provenance://host/commit/{sha}/query/meta"}
 
 
-def pr_create(repo: str, branch: str, title: str, body: str = "") -> dict:
-    """Open a PR via gh (best-effort). Returns the PR url or a fail if gh is unavailable."""
-    rc, out, err = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")  # ensure git
-    try:
-        cp = subprocess.run(["gh", "pr", "create", "--head", branch, "--title", title, "--body", body or title],
-                            capture_output=True, text=True, timeout=60, cwd=str(Path(repo).expanduser()))
-        if cp.returncode == 0:
-            return {"ok": True, "pr": cp.stdout.strip()}
-        return {"ok": False, "reason": (cp.stderr or "gh pr create failed").strip()[:200]}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"gh unavailable: {exc}"}
+def push_main(repo: str, *, remote: str = "origin", branch: str = "main") -> dict:
+    """Push the current HEAD onto ``branch`` on ``remote``. Replaces the PR step.
+
+    No force flag: a plain push already refuses a non-fast-forward, and a rejected push means
+    main moved underneath this worker — forcing over it would destroy someone else's commit.
+    The caller re-bases and retries."""
+    _, head, _ = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    rc, out, err = _git(repo, "push", remote, f"HEAD:{branch}", timeout=120.0)
+    if rc != 0:
+        return {"ok": False, "reason": (err or out or "push failed")[:200], "from_branch": head, "branch": branch}
+    _, sha, _ = _git(repo, "rev-parse", "HEAD")
+    return {"ok": True, "sha": sha, "from_branch": head, "branch": branch, "remote": remote}
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────
 
 @conn.handler("merge/query/gate", isolated=False,
-              meta={"label": "Merge-gate: auto_pr | human_review | block (lease+secrets+tests+ścieżki)"})
+              meta={"label": "Merge-gate: auto_push | block (lease+secrets+testy+ścieżki) — bez PR"})
 def merge_query_gate(files: Any = None, labels: Any = None, tests_passed: bool = True,
                      secrets_clean: bool = True, lease_id: str = "", worker: str = "",
                      is_git_repo: bool = True) -> dict[str, Any]:
@@ -243,7 +246,7 @@ def worktree_command_remove(repo: str = "", worktree: str = "") -> dict[str, Any
 
 
 @conn.handler("commit/command/create", isolated=True,
-              meta={"label": "Commit na branchu — TYLKO pod ważnym lease workera (nigdy main)"})
+              meta={"label": "Commit — TYLKO pod ważnym lease workera; trunk-based, main dozwolony"})
 def commit_command_create(repo: str = "", message: str = "", worker: str = "", lease_id: str = "",
                           ticket: str = "", title: str = "", locks: Any = None) -> dict[str, Any]:
     msg = message or provenance_message(ticket or "?", title or "change", worker, lease_id,
@@ -252,13 +255,14 @@ def commit_command_create(repo: str = "", message: str = "", worker: str = "", l
     return _ok(action="commit-create", **res) if res.get("ok") else _fail(res.get("reason", "commit failed"), "commit-create", **res)
 
 
-@conn.handler("pr/command/create", isolated=True, meta={"label": "Otwórz PR (gh) — po merge-gate auto_pr"})
-def pr_command_create(repo: str = "", branch: str = "", title: str = "", body: str = "",
-                      worker: str = "", lease_id: str = "") -> dict[str, Any]:
+@conn.handler("push/command/main", isolated=True,
+              meta={"label": "Push HEAD na main — po merge-gate auto_push (bez PR)"})
+def push_command_main(repo: str = "", worker: str = "", lease_id: str = "",
+                      remote: str = "origin", branch: str = "main") -> dict[str, Any]:
     if not _lease_valid(lease_id, worker):
-        return _fail("PR requires an active lease owned by this worker", "pr-create", rejected=True)
-    res = pr_create(repo, branch, title, body)
-    return _ok(action="pr-create", **res) if res.get("ok") else _fail(res.get("reason", "pr failed"), "pr-create", **res)
+        return _fail("push requires an active lease owned by this worker", "push-main", rejected=True)
+    res = push_main(repo, remote=remote, branch=branch)
+    return _ok(action="push-main", **res) if res.get("ok") else _fail(res.get("reason", "push failed"), "push-main", **res)
 
 
 # ── sync:// — non-git projects (e.g. if-uri via connect.ifuri.com) ────────────
@@ -292,7 +296,7 @@ def sync_project_query_status(project: str = "") -> dict[str, Any]:
 
 
 @sync_conn.handler("project/command/publish", isolated=True,
-                   meta={"label": "Utrwal zmianę sync-projektu jako patch artifact (po merge-gate auto_pr)"})
+                   meta={"label": "Utrwal zmianę sync-projektu jako patch artifact (po merge-gate auto_push)"})
 def sync_project_command_publish(project: str = "", worker: str = "", lease_id: str = "",
                                  name: str = "change") -> dict[str, Any]:
     if not _lease_valid(lease_id, worker):
